@@ -10,6 +10,11 @@
 #import <AssetsLibrary/AssetsLibrary.h>
 #import <Cordova/CDVPlugin.h>
 
+typedef enum : NSUInteger {
+    TorchToggle,
+    TorchOn,
+    TorchOff
+} TorchMode;
 
 //------------------------------------------------------------------------------
 // Delegate to handle orientation functions
@@ -66,6 +71,7 @@
 @property (nonatomic)         BOOL                        isFlipped;
 @property (nonatomic)         BOOL                        isTransitionAnimated;
 @property (nonatomic)         BOOL                        isSuccessBeepEnabled;
+@property (nonatomic)         BOOL                        isTorchAutoOn;
 
 
 - (id)initWithPlugin:(CDVBarcodeScanner*)plugin callback:(NSString*)callback parentViewController:(UIViewController*)parentViewController alterateOverlayXib:(NSString *)alternateXib;
@@ -171,6 +177,7 @@
     BOOL showTorchButton = [options[@"showTorchButton"] boolValue];
     BOOL disableAnimations = [options[@"disableAnimations"] boolValue];
     BOOL disableSuccessBeep = [options[@"disableSuccessBeep"] boolValue];
+    BOOL torchOn = [options[@"torchOn"] boolValue];
 
     // We allow the user to define an alternate xib file for loading the overlay.
     NSString *overlayXib = options[@"overlayXib"];
@@ -207,6 +214,10 @@
 
     if (showTorchButton) {
       processor.isShowTorchButton = true;
+    }
+    
+    if (torchOn) {
+      processor.isTorchAutoOn = true;
     }
 
     processor.isSuccessBeepEnabled = !disableSuccessBeep;
@@ -303,20 +314,20 @@ parentViewController:(UIViewController*)parentViewController
   alterateOverlayXib:(NSString *)alternateXib {
     self = [super init];
     if (!self) return self;
-
+    
     self.plugin               = plugin;
     self.callback             = callback;
     self.parentViewController = parentViewController;
     self.alternateXib         = alternateXib;
-
+    
     self.is1D      = YES;
     self.is2D      = YES;
     self.capturing = NO;
     self.results = [NSMutableArray new];
-
+    
     CFURLRef soundFileURLRef  = CFBundleCopyResourceURL(CFBundleGetMainBundle(), CFSTR("CDVBarcodeScanner.bundle/beep"), CFSTR ("caf"), NULL);
     AudioServicesCreateSystemSoundID(soundFileURLRef, &_soundFileObject);
-
+    
     return self;
 }
 
@@ -330,28 +341,30 @@ parentViewController:(UIViewController*)parentViewController
     self.previewLayer = nil;
     self.alternateXib = nil;
     self.results = nil;
-
+    
     self.capturing = NO;
-
+    
     AudioServicesRemoveSystemSoundCompletion(_soundFileObject);
     AudioServicesDisposeSystemSoundID(_soundFileObject);
 }
 
 //--------------------------------------------------------------------------
 - (void)scanBarcode {
-
-//    self.captureSession = nil;
-//    self.previewLayer = nil;
+    // add listeners
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleTorchAutoOn) name:AVCaptureSessionDidStartRunningNotification object:nil];
+    
+    //    self.captureSession = nil;
+    //    self.previewLayer = nil;
     NSString* errorMessage = [self setUpCaptureSession];
     if (errorMessage) {
         [self barcodeScanFailed:errorMessage];
         return;
     }
-
+    
     self.viewController = [[CDVbcsViewController alloc] initWithProcessor: self alternateOverlay:self.alternateXib];
     // here we set the orientation delegate to the MainViewController of the app (orientation controlled in the Project Settings)
     self.viewController.orientationDelegate = self.plugin.viewController;
-
+    
     // delayed [self openDialog];
     [self performSelector:@selector(openDialog) withObject:nil afterDelay:1];
 }
@@ -361,23 +374,28 @@ parentViewController:(UIViewController*)parentViewController
     [self.parentViewController
      presentViewController:self.viewController
      animated:self.isTransitionAnimated completion:nil
-     ];
+    ];
 }
 
 //--------------------------------------------------------------------------
 - (void)barcodeScanDone:(void (^)(void))callbackBlock {
+    // remove listeners
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:AVCaptureSessionDidStartRunningNotification object:nil];
+    // turn off torch
+    [self toggleTorch:TorchOff];
+    
     self.capturing = NO;
     [self.captureSession stopRunning];
     [self.parentViewController dismissViewControllerAnimated:self.isTransitionAnimated completion:callbackBlock];
-
-
+    
+    
     AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
     [device lockForConfiguration:nil];
     if([device isAutoFocusRangeRestrictionSupported]) {
         [device setAutoFocusRangeRestriction:AVCaptureAutoFocusRangeRestrictionNone];
     }
     [device unlockForConfiguration];
-
+    
     // viewcontroller holding onto a reference to us, release them so they
     // will release us
     self.viewController = nil;
@@ -386,21 +404,21 @@ parentViewController:(UIViewController*)parentViewController
 //--------------------------------------------------------------------------
 - (BOOL)checkResult:(NSString *)result {
     [self.results addObject:result];
-
+    
     NSInteger treshold = 7;
-
+    
     if (self.results.count > treshold) {
         [self.results removeObjectAtIndex:0];
     }
-
+    
     if (self.results.count < treshold)
     {
         return NO;
     }
-
+    
     BOOL allEqual = YES;
     NSString *compareString = self.results[0];
-
+    
     for (NSString *aResult in self.results)
     {
         if (![compareString isEqualToString:aResult])
@@ -410,7 +428,7 @@ parentViewController:(UIViewController*)parentViewController
             break;
         }
     }
-
+    
     return allEqual;
 }
 
@@ -450,6 +468,7 @@ parentViewController:(UIViewController*)parentViewController
     }
 }
 
+//--------------------------------------------------------------------------
 - (void)flipCamera {
     self.isFlipped = YES;
     self.isFrontCamera = !self.isFrontCamera;
@@ -457,21 +476,57 @@ parentViewController:(UIViewController*)parentViewController
         if (self.isFlipped) {
             self.isFlipped = NO;
         }
-    [self performSelector:@selector(scanBarcode) withObject:nil afterDelay:0.1];
+        [self performSelector:@selector(scanBarcode) withObject:nil afterDelay:0.1];
     }];
 }
 
 - (void)toggleTorch {
-  AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-  [device lockForConfiguration:nil];
-  if (device.flashActive) {
-    [device setTorchMode:AVCaptureTorchModeOff];
-    [device setFlashMode:AVCaptureFlashModeOff];
-  } else {
-    [device setTorchModeOnWithLevel:AVCaptureMaxAvailableTorchLevel error:nil];
-    [device setFlashMode:AVCaptureFlashModeOn];
-  }
-  [device unlockForConfiguration];
+    [self toggleTorch:TorchToggle];
+}
+- (void)toggleTorch:(TorchMode)mode {
+    if (![self deviceHasTorch]) {
+        return;
+    }
+    
+    AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+    [device lockForConfiguration:nil];
+    
+    BOOL modeOff = mode == TorchToggle || mode == TorchOff;
+    BOOL modeOn = mode == TorchToggle || mode == TorchOn;
+    if (modeOff && device.flashActive) {
+        [device setTorchMode:AVCaptureTorchModeOff];
+        [device setFlashMode:AVCaptureFlashModeOff];
+    }
+    else if (modeOn && !device.flashActive) {
+        [device setTorchModeOnWithLevel:AVCaptureMaxAvailableTorchLevel error:nil];
+        [device setFlashMode:AVCaptureFlashModeOn];
+    }
+    
+    [device unlockForConfiguration];
+}
+
+-(BOOL)deviceHasTorch {
+    if (NSClassFromString(@"AVCaptureDevice")) {
+        AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+        return [device hasTorch] && [device hasFlash];
+    }
+    return NO;
+}
+
+- (void)handleTorchAutoOn {
+    if (!self.isTorchAutoOn) {
+        return;
+    }
+    
+    if (self.captureSession == nil || self.viewController == nil) {
+        return;
+    }
+    
+    if (!self.captureSession.isRunning || !self.viewController.isBeingPresented || self.isFrontCamera) {
+        return;
+    }
+    
+    [self toggleTorch:TorchOn];
 }
 
 //--------------------------------------------------------------------------
@@ -827,7 +882,7 @@ parentViewController:(UIViewController*)parentViewController
 
 - (IBAction)torchButtonPressed:(id)sender
 {
-  [self.processor performSelector:@selector(toggleTorch) withObject:nil afterDelay:0];
+    [self.processor performSelector:@selector(toggleTorch) withObject:nil afterDelay:0];
 }
 
 //--------------------------------------------------------------------------
@@ -841,14 +896,14 @@ parentViewController:(UIViewController*)parentViewController
         return nil;
     }
 
-	self.overlayView.autoresizesSubviews = YES;
+    self.overlayView.autoresizesSubviews = YES;
     self.overlayView.autoresizingMask    = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     self.overlayView.opaque              = NO;
 
-	CGRect bounds = self.view.bounds;
+    CGRect bounds = self.view.bounds;
     bounds = CGRectMake(0, 0, bounds.size.width, bounds.size.height);
 
-	[self.overlayView setFrame:bounds];
+    [self.overlayView setFrame:bounds];
 
     return self.overlayView;
 }
@@ -913,23 +968,25 @@ parentViewController:(UIViewController*)parentViewController
 #endif
 
     if (_processor.isShowTorchButton && !_processor.isFrontCamera) {
-      AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-      if ([device hasTorch] && [device hasFlash]) {
-        NSURL *bundleURL = [[NSBundle mainBundle] URLForResource:@"CDVBarcodeScanner" withExtension:@"bundle"];
-        NSBundle *bundle = [NSBundle bundleWithURL:bundleURL];
-        NSString *imagePath = [bundle pathForResource:@"torch" ofType:@"png"];
-        UIImage *image = [UIImage imageWithContentsOfFile:imagePath];
+          if ([_processor deviceHasTorch]) {
+            NSURL *bundleURL = [[NSBundle mainBundle] URLForResource:@"CDVBarcodeScanner" withExtension:@"bundle"];
+            NSBundle *bundle = [NSBundle bundleWithURL:bundleURL];
+            NSString *imagePath = [bundle pathForResource:@"torch" ofType:@"png"];
+            UIImage *image = [UIImage imageWithContentsOfFile:imagePath];
 
-        id torchButton = [[UIBarButtonItem alloc]
-                           initWithImage:image
-                                   style:UIBarButtonItemStylePlain
-                                  target:(id)self
-                                  action:@selector(torchButtonPressed:)
-                           ];
+            id torchButton = [[UIBarButtonItem alloc]
+                               initWithImage:image
+                                       style:UIBarButtonItemStylePlain
+                                      target:(id)self
+                                      action:@selector(torchButtonPressed:)
+                               ];
 
-      [items insertObject:torchButton atIndex:0];
+          [items insertObject:torchButton atIndex:0];
+        }
+        
+        [_processor handleTorchAutoOn];
     }
-  }
+
     self.toolbar.items = items;
     [overlayView addSubview: self.toolbar];
 
